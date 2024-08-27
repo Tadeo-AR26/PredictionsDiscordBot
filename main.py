@@ -10,7 +10,7 @@ from itertools import cycle
 import asyncio
 from functions import administration, predictModule
 from functions.administration import register
-from functions.predictModule import mostrar_match, predecir
+from functions.predictModule import *
 import config
 
 intents = discord.Intents.all()
@@ -25,6 +25,9 @@ config.bot = commands.Bot(command_prefix='!', intents=intents)
 config.bot.add_command(register)
 config.bot.add_command(mostrar_match)
 config.bot.add_command(predecir)
+config.bot.add_command(points)
+config.bot.add_command(result)
+config.bot.add_command(leaderboard)
 
 
 config.bot.run(TOKEN)

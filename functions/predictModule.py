@@ -235,3 +235,201 @@ async def points(ctx):
     # Enviar mensaje al usuario con su puntaje total
     await ctx.send(f"{ctx.author.mention}, tus puntos han sido actualizados.\nPuntos actuales: {total_points}.")
 
+@commands.command(name='result')
+async def result(ctx):
+    conn = connect_db('database.db')
+    cursor = conn.cursor()
+    bot = config.bot
+
+    # Verificar si el usuario tiene privilegios de administrador
+    cursor.execute('SELECT admin FROM user WHERE uid_discord = ?', (str(ctx.author.id),))
+    user_info = cursor.fetchone()
+
+    if not user_info or user_info[0] != 1:
+        await ctx.send("No tienes permisos para usar este comando.")
+        return
+
+    # Obtener los partidos con state = 0
+    cursor.execute('''
+        SELECT m.id_match, t1.name, t1.image, t2.name, t2.image, m.team1_result, m.team2_result
+        FROM match m
+        JOIN teams t1 ON m.team1 = t1.id
+        JOIN teams t2 ON m.team2 = t2.id
+        WHERE m.state = 0
+    ''')
+    matches = cursor.fetchall()
+    conn.close()
+
+    if not matches:
+        await ctx.send("No hay partidos disponibles.")
+        return
+
+    embeds = []
+    files = []
+    botones_descripcion = (
+        "**Reacciones para actualizar el resultado:**\n"
+        "1️⃣: 3-0\n"
+        "2️⃣: 3-1\n"
+        "3️⃣: 3-2\n"
+        "4️⃣: 2-3\n"
+        "5️⃣: 1-3\n"
+        "6️⃣: 0-3\n"
+    )
+
+    for match in matches:
+        match_id, team1_name, team1_image, team2_name, team2_image, team1_result, team2_result = match
+        combined_image_bytes = fetch_and_combine_images(team1_image, team2_image)
+        description = f"{team1_name} VS {team2_name}\n\n{botones_descripcion}"
+
+        image_file = discord.File(fp=BytesIO(combined_image_bytes), filename=f'combined_image_{match_id}.png')
+        files.append(image_file)
+
+        embed = discord.Embed(title=f"Match {match_id}", description=description, color=0xff0000)
+        embed.set_image(url=f"attachment://combined_image_{match_id}.png")
+        embeds.append(embed)
+
+    current_index = 0
+
+    async def update_message(message):
+        current_embed = embeds[current_index]
+        current_file = files[current_index]
+        with BytesIO(current_file.fp.getvalue()) as image_file:
+            image_file.seek(0)
+            new_file = discord.File(fp=image_file, filename=current_file.filename)
+            await message.edit(embed=current_embed, attachments=[new_file])
+
+    message = await ctx.send(embed=embeds[current_index], file=files[current_index])
+
+    await message.add_reaction('⬅️')
+    await message.add_reaction('1️⃣')
+    await message.add_reaction('2️⃣')
+    await message.add_reaction('3️⃣')
+    await message.add_reaction('4️⃣')
+    await message.add_reaction('5️⃣')
+    await message.add_reaction('6️⃣')
+    await message.add_reaction('➡️')
+
+    def check(reaction, user):
+        return user == ctx.author and str(reaction.emoji) in ['⬅️', '➡️', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣'] and reaction.message.id == message.id
+
+    async def handle_reactions():
+        nonlocal current_index
+        while True:
+            try:
+                reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
+                await message.remove_reaction(reaction, user)
+
+                if str(reaction.emoji) == '➡️':
+                    current_index = (current_index + 1) % len(embeds)
+                elif str(reaction.emoji) == '⬅️':
+                    current_index = (current_index - 1) % len(embeds)
+                elif str(reaction.emoji) in ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '6️⃣']:
+                    results_map = {
+                        '1️⃣': (3, 0),
+                        '2️⃣': (3, 1),
+                        '3️⃣': (3, 2),
+                        '4️⃣': (2, 3),
+                        '5️⃣': (1, 3),
+                        '6️⃣': (0, 3)
+                    }
+                    team1_result, team2_result = results_map[str(reaction.emoji)]
+                    current_match_id = matches[current_index][0]
+
+                    conn = connect_db('database.db')
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        UPDATE match
+                        SET team1_result = ?, team2_result = ?, state = 1
+                        WHERE id_match = ?
+                    ''', (team1_result, team2_result, current_match_id))
+                    conn.commit()
+                    conn.close()
+
+                await update_message(message)
+
+            except asyncio.TimeoutError:
+                await ctx.send("Tiempo de espera agotado. Por favor intenta nuevamente.")
+                break
+
+    bot.loop.create_task(handle_reactions())
+
+@commands.command(name='leaderboard')
+async def leaderboard(ctx):
+    conn = connect_db('database.db')
+    cursor = conn.cursor()
+
+    # Actualizar puntos de todos los usuarios
+    cursor.execute('SELECT id_user, uid_discord, puntos FROM user')
+    users = cursor.fetchall()
+
+    cursor.execute('SELECT id_match, team1_result, team2_result FROM match WHERE state = 1')
+    matches = cursor.fetchall()
+
+    for user in users:
+        user_id, discord_id, current_points = user
+        additional_points = 0
+
+        cursor.execute('SELECT match, team1_result, team2_result FROM prediction WHERE user = ? AND flag = 0', (user_id,))
+        predictions = cursor.fetchall()
+
+        for prediction in predictions:
+            match_id, predicted_team1_result, predicted_team2_result = prediction
+            match = next((m for m in matches if m[0] == match_id), None)
+
+            if match:
+                match_team1_result, match_team2_result = match[1], match[2]
+
+                if match_team1_result == predicted_team1_result and match_team2_result == predicted_team2_result:
+                    additional_points += 3
+                elif (match_team1_result > match_team2_result and predicted_team1_result > predicted_team2_result) or \
+                     (match_team1_result < match_team2_result and predicted_team1_result < predicted_team2_result):
+                    additional_points += 1
+
+                cursor.execute('UPDATE prediction SET flag = 1 WHERE user = ? AND match = ?', (user_id, match_id))
+
+        if additional_points > 0:
+            cursor.execute('UPDATE user SET puntos = puntos + ? WHERE id_user = ?', (additional_points, user_id))
+
+    conn.commit()
+
+    # Obtener la lista de usuarios ordenada por puntos de mayor a menor
+    cursor.execute('SELECT name, puntos FROM user ORDER BY puntos DESC')
+    leaderboard = cursor.fetchall()
+    conn.close()
+
+    # Dividir la tabla de posiciones en grupos de 10
+    groups = [leaderboard[i:i+10] for i in range(0, len(leaderboard), 10)]
+    current_index = 0
+
+    async def send_embed(index):
+        embed = discord.Embed(title="Leaderboard", color=0x00ff00)
+        for i, (name, puntos) in enumerate(groups[index]):
+            embed.add_field(name=f"{i + 1 + index * 10}. **{name}**: {puntos} Ptos", value="", inline=False)
+        embed.set_footer(text=f"Página {index + 1} de {len(groups)}")
+        return await ctx.send(embed=embed)
+
+    message = await send_embed(current_index)
+
+    # Añadir reacciones de flechas si hay más de un grupo
+    if len(groups) > 1:
+        await message.add_reaction('⬅️')
+        await message.add_reaction('➡️')
+
+        def check(reaction, user):
+            return user == ctx.author and str(reaction.emoji) in ['⬅️', '➡️'] and reaction.message.id == message.id
+
+        while True:
+            try:
+                reaction, user = await bot.wait_for('reaction_add', timeout=60.0, check=check)
+                await message.remove_reaction(reaction, user)
+
+                if str(reaction.emoji) == '⬅️':
+                    current_index = (current_index - 1) % len(groups)
+                elif str(reaction.emoji) == '➡️':
+                    current_index = (current_index + 1) % len(groups)
+
+                await message.edit(embed=await send_embed(current_index))
+
+            except asyncio.TimeoutError:
+                await ctx.send("Tiempo de espera agotado. Por favor intenta nuevamente.")
+                break
